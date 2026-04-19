@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Market Maker Simulator — by Nicolás Arriz</title>
+<meta name="description" content="Browser-based market-making training simulator. Quote two-way prices to clients, hedge on the exchange, and manage your PnL in real time." />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header id="top-header">
+  <div class="header-left">
+    <span class="brand">MARKET MAKER SIMULATOR</span>
+    <span class="author">by Nicolás Arriz</span>
+    <span id="lbl-time" class="stat">T: 0</span>
+    <span id="lbl-realized" class="stat pos">Realized PnL: 0</span>
+    <span id="lbl-unrealized" class="stat pos">Unrealized PnL: 0</span>
+    <span id="lbl-total" class="stat highlight">Total PnL: 0</span>
+    <span id="lbl-commission" class="stat neg">Commission Paid: 0</span>
+  </div>
+  <div class="header-right">
+    <span id="lbl-cash" class="stat">Cash: 0</span>
+    <button id="btn-pause" class="btn btn-grey">Pause</button>
+    <button id="btn-reset" class="btn btn-grey">Reset</button>
+  </div>
+</header>
+
+<main id="grid">
+  <!-- LEFT: CLIENT / RFQ -->
+  <section id="panel-left" class="panel">
+    <h2>CLIENT / RFQ</h2>
+    <ul id="chat-list" class="scroll-list"></ul>
+    <p id="rfq-info" class="rfq-info">No active RFQ.</p>
+    <div class="quote-row">
+      <label>Your BID</label>
+      <input id="entry-bid" type="number" step="0.01" inputmode="decimal" />
+    </div>
+    <div class="quote-row">
+      <label>Your ASK</label>
+      <input id="entry-ask" type="number" step="0.01" inputmode="decimal" />
+    </div>
+    <button id="btn-quote" class="btn btn-blue">SEND QUOTE</button>
+  </section>
+
+  <!-- CENTER: NEWS + EXCHANGE + MID -->
+  <section id="panel-center">
+    <div class="panel" id="news-panel">
+      <h2>NEWS FEED</h2>
+      <ul id="news-list" class="scroll-list small"></ul>
+    </div>
+
+    <div class="center-row">
+      <div class="panel" id="exchange-panel">
+        <h2>EXCHANGE</h2>
+        <div class="exch-row">
+          <label>Symbol:</label>
+          <select id="symbol-select"></select>
+          <span id="lbl-mid" class="mid-label">Mid: -</span>
+        </div>
+        <div class="exch-row">
+          <span id="lbl-exch-bid" class="pos">Bid: -</span>
+          <span id="lbl-exch-ask" class="neg">Ask: -</span>
+        </div>
+        <div class="exch-row">
+          <label>Size</label>
+          <input id="exch-size" type="number" value="1000" />
+          <button id="btn-buy-exch" class="btn btn-green">BUY on EXCH</button>
+          <button id="btn-sell-exch" class="btn btn-red">SELL on EXCH</button>
+        </div>
+      </div>
+
+      <div class="panel" id="mid-panel">
+        <h2>MID PRICES</h2>
+        <table id="mid-table"></table>
+      </div>
+    </div>
+
+    <p id="msg-bar" class="msg-bar"></p>
+  </section>
+
+  <!-- RIGHT: POSITIONS -->
+  <section id="panel-right" class="panel">
+    <h2>POSITIONS</h2>
+    <table id="pos-table">
+      <thead>
+        <tr>
+          <th>Symbol</th><th>Net Pos</th><th>Avg Price</th><th>Pos Value</th><th>U-PnL</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <!-- BOTTOM: CHART -->
+  <section id="chart-panel" class="panel">
+    <h2 id="chart-title">PRICE CHART — AAPL</h2>
+    <canvas id="price-chart" width="960" height="260"></canvas>
+  </section>
+</main>
+
+<footer id="bottom-footer">
+  <span>Trading-desk training tool inspired by the AmplifyMe Finance Accelerator. Open-source on
+    <a href="https://github.com/nicolasarriz/market-maker-simulator-web" target="_blank" rel="noopener">GitHub</a>.
+  </span>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>

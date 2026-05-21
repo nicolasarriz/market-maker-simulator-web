@@ -159,6 +159,8 @@ input[type="number"]:focus, select:focus { border-color: var(--fg-highlight); }
   flex-wrap: wrap;
 }
 .exch-row label { min-width: 52px; color: var(--fg-text); }
+.exch-btn-row { gap: 10px; }
+.exch-btn-row .btn { flex: 1; padding: 8px 12px; }
 .mid-label {
   margin-left: auto;
   color: var(--fg-text);

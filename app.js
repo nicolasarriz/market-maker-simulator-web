@@ -399,11 +399,10 @@ class MarketMakerApp {
     this._updateMidMonitor(prices);
 
     if (news) {
-      const dir = news.direction > 0 ? "BULLISH" : "BEARISH";
       const symTxt = newsSymbol || "MKT";
       const hitsInSec = (news.leadTicks * TICK_MS / 1000).toFixed(1);
       const overSec = (news.durationTicks * TICK_MS / 1000).toFixed(1);
-      const txt = `${symTxt}: [${dir}] ${news.headline} (~${fmt(news.impactBp, 0)}bp, hits in ${hitsInSec}s over ${overSec}s)`;
+      const txt = `${symTxt}: ${news.headline} (~${fmt(news.impactBp, 0)}bp, hits in ${hitsInSec}s over ${overSec}s)`;
       this._appendNews(txt);
     }
 
@@ -516,8 +515,6 @@ class MarketMakerApp {
   _appendNews(txt) {
     const li = document.createElement("li");
     li.textContent = txt;
-    if (txt.includes("BULLISH")) li.style.color = "var(--fg-positive)";
-    else if (txt.includes("BEARISH")) li.style.color = "var(--fg-negative)";
     this.$newsList.appendChild(li);
     while (this.$newsList.children.length > 40) this.$newsList.removeChild(this.$newsList.firstChild);
     this.$newsList.scrollTop = this.$newsList.scrollHeight;

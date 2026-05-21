@@ -25,20 +25,47 @@ function fmt(x, digits = 2) { return Number(x).toFixed(digits); }
 function fmtInt(x) { return Math.round(x).toLocaleString("en-US"); }
 
 // ==================== ENGINE ====================
+// Mean-reverting GBM (Ornstein–Uhlenbeck on log-price) around a slowly
+// random-walking "anchor", plus a decaying vol-cluster after news.
 class AssetPriceProcess {
-  constructor(symbol, startPrice, volBp = 13.0) {
+  constructor(symbol, startPrice, volBp = 5.0) {
     this.symbol = symbol;
     this.price = startPrice;
-    this.volBp = volBp;
+    this.anchor = startPrice;
+    this.baseVolBp = volBp;
+    this.anchorDriftBp = 0.8;
+    this.meanRevStrength = 0.025;
+    this.volShockBp = 0.0;
+    this.pendingImpacts = [];
   }
-  step(news = null) {
-    const epsBp = randGauss(0, this.volBp);
-    const move = this.price * epsBp / 10000.0;
-    let newsMove = 0.0;
-    if (news) newsMove = this.price * news.direction * news.impactBp / 10000.0;
+  step() {
+    this.anchor *= 1 + randGauss(0, this.anchorDriftBp) / 10000.0;
+    this.volShockBp *= 0.85;
+
+    const sigmaBp = this.baseVolBp + this.volShockBp;
+    const eps = randGauss(0, sigmaBp);
+    const reversionBp = -this.meanRevStrength * Math.log(this.price / this.anchor) * 10000.0;
+    const move = this.price * (eps + reversionBp) / 10000.0;
+
+    let newsMoveBp = 0.0;
+    const remaining = [];
+    for (const imp of this.pendingImpacts) {
+      if (imp.leadLeft > 0) { imp.leadLeft -= 1; remaining.push(imp); continue; }
+      newsMoveBp += imp.perTickBp;
+      imp.ticksLeft -= 1;
+      if (imp.ticksLeft > 0) remaining.push(imp);
+    }
+    this.pendingImpacts = remaining;
+    const newsMove = this.price * newsMoveBp / 10000.0;
+
     this.price += move + newsMove;
     if (this.price <= 0) this.price = 0.01;
     return this.price;
+  }
+  scheduleNewsImpact(directionSign, totalImpactBp, leadTicks, durationTicks) {
+    const perTickBp = directionSign * totalImpactBp / durationTicks;
+    this.pendingImpacts.push({ leadLeft: leadTicks, ticksLeft: durationTicks, perTickBp });
+    this.volShockBp += totalImpactBp * 0.20;
   }
   applyTradeImpact(signedSize) {
     if (signedSize === 0) return this.price;
@@ -50,7 +77,7 @@ class AssetPriceProcess {
 }
 
 class NewsGenerator {
-  constructor(probNews = 0.15) {
+  constructor(probNews = 0.04) {
     this.probNews = probNews;
     this.POSITIVE = [
       "Earnings beat expectations",
@@ -70,9 +97,11 @@ class NewsGenerator {
   maybeGenerate(t) {
     if (Math.random() > this.probNews) return null;
     const direction = randChoice([-1, 1]);
-    const impactBp = randUniform(10, 80);
+    const impactBp = randUniform(15, 70);
+    const leadTicks = Math.floor(randUniform(2, 5));
+    const durationTicks = Math.floor(randUniform(3, 7));
     const pool = direction > 0 ? this.POSITIVE : this.NEGATIVE;
-    return { time: t, headline: randChoice(pool), direction, impactBp };
+    return { time: t, headline: randChoice(pool), direction, impactBp, leadTicks, durationTicks };
   }
 }
 
@@ -237,12 +266,15 @@ class MarketEnvironment {
   step() {
     this.time += 1;
     const news = this.newsGen.maybeGenerate(this.time);
-    const newsSymbol = news ? randChoice(this.symbols) : null;
-    const prices = {};
-    for (const [sym, asset] of Object.entries(this.assets)) {
-      const pNews = (news && sym === newsSymbol) ? news : null;
-      prices[sym] = asset.step(pNews);
+    let newsSymbol = null;
+    if (news) {
+      newsSymbol = randChoice(this.symbols);
+      this.assets[newsSymbol].scheduleNewsImpact(
+        news.direction, news.impactBp, news.leadTicks, news.durationTicks,
+      );
     }
+    const prices = {};
+    for (const [sym, asset] of Object.entries(this.assets)) prices[sym] = asset.step();
     return { newsSymbol, news, prices };
   }
 }
@@ -369,7 +401,9 @@ class MarketMakerApp {
     if (news) {
       const dir = news.direction > 0 ? "BULLISH" : "BEARISH";
       const symTxt = newsSymbol || "MKT";
-      const txt = `${symTxt}: [${dir}] ${news.headline} (impact ~${fmt(news.impactBp, 1)}bp)`;
+      const hitsInSec = (news.leadTicks * TICK_MS / 1000).toFixed(1);
+      const overSec = (news.durationTicks * TICK_MS / 1000).toFixed(1);
+      const txt = `${symTxt}: [${dir}] ${news.headline} (~${fmt(news.impactBp, 0)}bp, hits in ${hitsInSec}s over ${overSec}s)`;
       this._appendNews(txt);
     }
 

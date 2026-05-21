@@ -28,13 +28,13 @@ function fmtInt(x) { return Math.round(x).toLocaleString("en-US"); }
 // Mean-reverting GBM (Ornstein–Uhlenbeck on log-price) around a slowly
 // random-walking "anchor", plus a decaying vol-cluster after news.
 class AssetPriceProcess {
-  constructor(symbol, startPrice, volBp = 5.0) {
+  constructor(symbol, startPrice, volBp = 2.5) {
     this.symbol = symbol;
     this.price = startPrice;
     this.anchor = startPrice;
     this.baseVolBp = volBp;
-    this.anchorDriftBp = 0.8;
-    this.meanRevStrength = 0.025;
+    this.anchorDriftBp = 0.4;
+    this.meanRevStrength = 0.05;
     this.volShockBp = 0.0;
     this.pendingImpacts = [];
   }

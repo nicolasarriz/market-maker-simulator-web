@@ -11,6 +11,31 @@ const EXCH_COMM_BP = 0.5;
 const TICK_MS = 1500;
 const MAX_CHART_POINTS = 120;
 
+// Per-symbol liquidity profile (#4). The index (SPX) is deeper and tighter than
+// the single name (AAPL): smaller exchange spread, larger typical tickets, less
+// price impact per share, lower base vol, and a larger risk limit.
+const SYMBOL_CONFIG = {
+  AAPL: {
+    start: 150.0, volBp: 3.0, anchorDriftBp: 0.40,
+    exchHalfSpreadBp: 6.0, exchBlock: 100, exchMaxHalfSpreadBp: 150.0,
+    impactBpPer1k: 8.0,
+    rfqSizes: [100, 250, 500, 1000],
+    clientHalfSpreadBp: 12.0,
+    posLimitNotional: 2_000_000,
+  },
+  SPX: {
+    start: 4200.0, volBp: 1.5, anchorDriftBp: 0.25,
+    exchHalfSpreadBp: 2.0, exchBlock: 250, exchMaxHalfSpreadBp: 80.0,
+    impactBpPer1k: 3.0,
+    rfqSizes: [50, 100, 200, 400],
+    clientHalfSpreadBp: 6.0,
+    posLimitNotional: 5_000_000,
+  },
+};
+// Inventory skew (#1) and risk limits (#2).
+const MAX_SKEW_BP = 8.0;       // max center shift applied to suggested client quote
+const POS_WARN_FRAC = 0.75;    // highlight positions above this fraction of the limit
+
 // ==================== RNG HELPERS ====================
 function randGauss(mean = 0, std = 1) {
   // Box–Muller
@@ -28,12 +53,13 @@ function fmtInt(x) { return Math.round(x).toLocaleString("en-US"); }
 // Mean-reverting GBM (Ornstein–Uhlenbeck on log-price) around a slowly
 // random-walking "anchor", plus a decaying vol-cluster after news.
 class AssetPriceProcess {
-  constructor(symbol, startPrice, volBp = 2.5) {
+  constructor(symbol, cfg) {
     this.symbol = symbol;
-    this.price = startPrice;
-    this.anchor = startPrice;
-    this.baseVolBp = volBp;
-    this.anchorDriftBp = 0.4;
+    this.cfg = cfg;
+    this.price = cfg.start;
+    this.anchor = cfg.start;
+    this.baseVolBp = cfg.volBp;
+    this.anchorDriftBp = cfg.anchorDriftBp;
     this.meanRevStrength = 0.05;
     this.volShockBp = 0.0;
     this.pendingImpacts = [];
@@ -69,7 +95,7 @@ class AssetPriceProcess {
   }
   applyTradeImpact(signedSize) {
     if (signedSize === 0) return this.price;
-    const impactBp = 8.0 * signedSize / 1000.0;
+    const impactBp = this.cfg.impactBpPer1k * signedSize / 1000.0;
     this.price *= 1.0 + impactBp / 10000.0;
     if (this.price <= 0) this.price = 0.01;
     return this.price;
@@ -110,24 +136,40 @@ class Client {
     this.name = name;
     this.aggressiveness = aggressiveness;
   }
-  decideTrade(side, size, trueMid, bid, ask) {
+  // Two-way RFQ (#3): the client has a hidden latent axe (`latentSide`) but only
+  // commits to it if the price is acceptable — AND will pick off whichever side
+  // you quote through fair value, regardless of its axe. That is the adverse
+  // selection that punishes a badly skewed two-way price.
+  decideTwoWay(latentSide, size, trueMid, bid, ask) {
     const spreadBp = (ask - bid) / trueMid * 10000.0;
-    const edgeBp = side === "sell"
-      ? (bid - trueMid) / trueMid * 10000.0
-      : (trueMid - ask) / trueMid * 10000.0;
+    const sellEdgeBp = (bid - trueMid) / trueMid * 10000.0; // client sells @ bid
+    const buyEdgeBp = (trueMid - ask) / trueMid * 10000.0;  // client buys @ ask
 
+    // 1) Pick-off: a side quoted through fair value (positive edge) gets taken.
+    const PICKOFF_BP = 1.0;
+    if ((buyEdgeBp > PICKOFF_BP || sellEdgeBp > PICKOFF_BP) && Math.random() < 0.9) {
+      if (buyEdgeBp >= sellEdgeBp) {
+        return { action: "lift_ask", price: ask,
+          msg: `Lifting your offer — ${size} @ ${fmt(ask)} (you're through fair).` };
+      }
+      return { action: "hit_bid", price: bid,
+        msg: `Hitting your bid — ${size} @ ${fmt(bid)} (you're through fair).` };
+    }
+
+    // 2) Otherwise the client trades its latent axe if the level is good enough.
+    const edgeBp = latentSide === "sell" ? sellEdgeBp : buyEdgeBp;
     const baseProb = 0.2 + 0.5 * this.aggressiveness;
     let probTrade = baseProb + 0.02 * edgeBp - 0.003 * Math.max(0.0, spreadBp - 40.0);
     probTrade = Math.max(0.02, Math.min(0.95, probTrade));
 
     if (Math.random() < probTrade) {
-      if (side === "sell") {
+      if (latentSide === "sell") {
         return { action: "hit_bid", price: bid, msg: `OK, I'll sell you ${size} @ ${fmt(bid)}.` };
-      } else {
-        return { action: "lift_ask", price: ask, msg: `OK, I'll buy ${size} @ ${fmt(ask)}.` };
       }
+      return { action: "lift_ask", price: ask, msg: `OK, I'll buy ${size} @ ${fmt(ask)}.` };
     }
 
+    // 3) Negotiate or walk away (based on the latent side).
     let negoProb = 0.0;
     if (spreadBp > 60) negoProb += 0.4;
     if (edgeBp < -8) negoProb += 0.3;
@@ -138,11 +180,11 @@ class Client {
       return {
         action: "negotiate",
         price: null,
-        msg: this._negotiationMessage(side, size, trueMid, bid, ask, spreadBp, edgeBp),
+        msg: this._negotiationMessage(latentSide, size, trueMid, bid, ask, spreadBp, edgeBp),
       };
     }
 
-    const msg = side === "sell"
+    const msg = latentSide === "sell"
       ? "No thanks, your bid is too low for me."
       : "No trade, your offer is too expensive.";
     return { action: "reject", price: null, msg };
@@ -255,11 +297,11 @@ class MarketMaker {
 }
 
 class MarketEnvironment {
-  constructor(symbols = ["AAPL", "SPX"], startPrices = [150.0, 4200.0]) {
+  constructor(symbols = ["AAPL", "SPX"]) {
     this.time = 0;
     this.symbols = [...symbols];
     this.assets = {};
-    symbols.forEach((s, i) => this.assets[s] = new AssetPriceProcess(s, startPrices[i]));
+    symbols.forEach(s => this.assets[s] = new AssetPriceProcess(s, SYMBOL_CONFIG[s]));
     this.newsGen = new NewsGenerator();
     this.client = new Client("HF_1", 0.6);
   }
@@ -289,7 +331,6 @@ class MarketMakerApp {
     this.priceHistory = {};
     this.symbols.forEach(s => this.priceHistory[s] = []);
     this.activeRfq = null;
-    this.rngSizes = [100, 250, 500, 1000];
     this.running = true;
     this.lastMids = {};
     this.symbols.forEach(s => this.lastMids[s] = this.env.assets[s].price);
@@ -407,14 +448,23 @@ class MarketMakerApp {
     }
 
     if (this.activeRfq === null && Math.random() < 0.6) {
-      const side = randChoice(["buy", "sell"]);
-      const size = randChoice(this.rngSizes);
+      const side = randChoice(["buy", "sell"]); // latent axe, hidden from player
       const sym = randChoice(this.symbols);
+      const size = randChoice(this.env.assets[sym].cfg.rfqSizes);
       const mid = prices[sym];
       this.activeRfq = { symbol: sym, side, size, mid };
-      this.$rfqInfo.textContent = `Client RFQ: two-way price for ${sym}, size ${size} (side hidden).`;
+
+      // #1 — suggest an inventory-skewed two-way and pre-fill the inputs.
+      const sug = this.computeSuggestedQuote(sym, mid, size);
+      this.$entryBid.value = fmt(sug.bid);
+      this.$entryAsk.value = fmt(sug.ask);
+      let skewTxt = "flat";
+      if (sug.skewBp < -0.5) skewTxt = `skewed down ${fmt(-sug.skewBp, 1)}bp (you're long)`;
+      else if (sug.skewBp > 0.5) skewTxt = `skewed up ${fmt(sug.skewBp, 1)}bp (you're short)`;
+
+      this.$rfqInfo.textContent = `Client RFQ: two-way for ${sym}, size ${size} (side hidden). Suggested ${skewTxt}.`;
       this.logChat("Client", `Please make me a price for ${size} ${sym}.`);
-      this.$msgBar.textContent = "Enter BID/ASK on the left and press Enter.";
+      this.$msgBar.textContent = "Suggested quote pre-filled — adjust BID/ASK and press Enter.";
     } else if (this.activeRfq === null) {
       this.$rfqInfo.textContent = "No active RFQ.";
     }
@@ -464,7 +514,9 @@ class MarketMakerApp {
   _updatePnlAndHeader(prices) {
     const realized = this.mm.realizedPnl();
     const mtm = this.mm.mtmPnl(prices);
-    const total = realized + mtm;
+    // Total PnL is the true change in equity: gross trading PnL net of all
+    // commissions paid. (cash + position value - initial cash == this.)
+    const total = realized + mtm - this.mm.commissions;
     this.$time.textContent = `T: ${this.env.time}`;
     this.$realized.textContent = `Realized PnL: ${fmtInt(realized)}`;
     this.$unrealized.textContent = `Unrealized PnL: ${fmtInt(mtm)}`;
@@ -529,9 +581,17 @@ class MarketMakerApp {
       const value = pos * price;
       const upnl = pos !== 0 ? (price - avg) * pos : 0.0;
       const cls = upnl > 0 ? "pos-positive" : upnl < 0 ? "pos-negative" : "";
+
+      // #2 — risk highlight vs the per-symbol notional limit.
+      const limit = this.env.assets[sym].cfg.posLimitNotional;
+      const used = Math.abs(value) / limit;
+      let riskCls = "", mark = "";
+      if (used > 1.0) { riskCls = "risk-over"; mark = " 🔴"; }
+      else if (used > POS_WARN_FRAC) { riskCls = "risk-warn"; mark = " 🟠"; }
+
       const tr = document.createElement("tr");
-      tr.className = cls;
-      tr.innerHTML = `<td>${sym}</td><td>${pos}</td><td>${fmt(avg)}</td><td>${fmtInt(value)}</td><td>${fmtInt(upnl)}</td>`;
+      tr.className = `${cls} ${riskCls}`.trim();
+      tr.innerHTML = `<td>${sym}${mark}</td><td>${pos}</td><td>${fmt(avg)}</td><td>${fmtInt(value)}</td><td>${fmtInt(upnl)}</td>`;
       this.$posBody.appendChild(tr);
     });
   }
@@ -554,10 +614,12 @@ class MarketMakerApp {
     const scaleY = (H - 2 * padding) / (maxP - minP);
     const scaleX = (W - 2 * padding) / (series.length - 1);
 
-    ctx.strokeStyle = "#333a4d";
-    ctx.fillStyle = "#7f8aa5";
+    // grid + price levels
+    ctx.strokeStyle = "rgba(255,255,255,0.06)";
+    ctx.fillStyle = "#6b7d9c";
     ctx.font = "11px Consolas, monospace";
-    ctx.setLineDash([4, 4]);
+    ctx.setLineDash([3, 5]);
+    ctx.lineWidth = 1;
     const nLevels = 4;
     for (let i = 0; i <= nLevels; i++) {
       const level = minP + (maxP - minP) * i / nLevels;
@@ -566,42 +628,98 @@ class MarketMakerApp {
       ctx.moveTo(padding, y);
       ctx.lineTo(W - padding, y);
       ctx.stroke();
-      ctx.fillText(fmt(level), 5, y + 3);
+      ctx.fillText(fmt(level), 6, y + 3);
     }
     ctx.setLineDash([]);
 
-    ctx.strokeStyle = "#ffcc33";
+    // trend colour: green if rising over the window, red if falling
+    const rising = series[series.length - 1] >= series[0];
+    const lineColor = rising ? "#34e08a" : "#ff6166";
+    const baseY = H - padding;
+    const xAt = i => padding + i * scaleX;
+    const yAt = p => baseY - (p - minP) * scaleY;
+
+    // gradient area fill under the line
+    const grad = ctx.createLinearGradient(0, padding, 0, baseY);
+    grad.addColorStop(0, rising ? "rgba(52,224,138,0.28)" : "rgba(255,97,102,0.26)");
+    grad.addColorStop(1, "rgba(52,224,138,0)");
+    ctx.beginPath();
+    ctx.moveTo(xAt(0), baseY);
+    series.forEach((p, i) => ctx.lineTo(xAt(i), yAt(p)));
+    ctx.lineTo(xAt(series.length - 1), baseY);
+    ctx.closePath();
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // price line with soft glow
+    ctx.save();
+    ctx.strokeStyle = lineColor;
     ctx.lineWidth = 2;
+    ctx.lineJoin = "round";
+    ctx.shadowColor = lineColor;
+    ctx.shadowBlur = 8;
     ctx.beginPath();
     series.forEach((p, i) => {
-      const x = padding + i * scaleX;
-      const y = H - padding - (p - minP) * scaleY;
+      const x = xAt(i), y = yAt(p);
       if (i === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
     });
     ctx.stroke();
+    ctx.restore();
 
-    // last-price marker
-    const lastX = padding + (series.length - 1) * scaleX;
-    const lastY = H - padding - (series[series.length - 1] - minP) * scaleY;
-    ctx.fillStyle = "#ffcc33";
+    // last-price marker with halo
+    const lastX = xAt(series.length - 1);
+    const lastY = yAt(series[series.length - 1]);
+    ctx.fillStyle = "rgba(255,255,255,0.12)";
     ctx.beginPath();
-    ctx.arc(lastX, lastY, 3, 0, Math.PI * 2);
+    ctx.arc(lastX, lastY, 7, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = lineColor;
+    ctx.beginPath();
+    ctx.arc(lastX, lastY, 3.5, 0, Math.PI * 2);
     ctx.fill();
   }
 
   // ==================== EXCHANGE MODEL ====================
-  computeExchangeQuotes(mid, size) {
+  computeExchangeQuotes(mid, size, sym = this.currentSymbol) {
+    const cfg = this.env.assets[sym].cfg;
     size = Math.max(1, Math.abs(size));
-    const baseBlock = 100;
-    const baseHalfSpreadBp = 6.0;
-    const sizeFactor = Math.pow(size / baseBlock, 1.1);
-    let halfSpreadBp = baseHalfSpreadBp * sizeFactor;
-    halfSpreadBp = Math.max(4.0, Math.min(150.0, halfSpreadBp));
+    const sizeFactor = Math.pow(size / cfg.exchBlock, 1.1);
+    let halfSpreadBp = cfg.exchHalfSpreadBp * sizeFactor;
+    halfSpreadBp = Math.max(cfg.exchHalfSpreadBp * 0.7, Math.min(cfg.exchMaxHalfSpreadBp, halfSpreadBp));
     halfSpreadBp += randUniform(-1.0, 4.0);
     const bid = mid * (1 - halfSpreadBp / 10000.0);
     const ask = mid * (1 + halfSpreadBp / 10000.0);
     return [bid, ask];
+  }
+
+  // #1 — inventory-skewed two-way the player *should* quote a client. The center
+  // is shifted away from your inventory (long -> lower, to encourage selling and
+  // discourage buying), with a per-symbol half-spread on top.
+  computeSuggestedQuote(sym, mid, size) {
+    const cfg = this.env.assets[sym].cfg;
+    const posNotional = this.mm.position(sym) * mid;
+    const frac = Math.max(-1.5, Math.min(1.5, posNotional / cfg.posLimitNotional));
+    const skewBp = -frac * MAX_SKEW_BP;
+    const center = mid * (1 + skewBp / 10000.0);
+    const half = cfg.clientHalfSpreadBp / 10000.0;
+    return { bid: center * (1 - half), ask: center * (1 + half), skewBp };
+  }
+
+  // #2 — risk limits. Returns how a position change sits against the per-symbol
+  // notional limit, and whether it *increases* exposure (reducing is always ok).
+  _riskCheck(sym, deltaShares) {
+    const cfg = this.env.assets[sym].cfg;
+    const mid = this.env.assets[sym].price;
+    const curPos = this.mm.position(sym);
+    const newPos = curPos + deltaShares;
+    const newNotional = Math.abs(newPos * mid);
+    return {
+      limit: cfg.posLimitNotional,
+      newNotional,
+      increasing: Math.abs(newPos) > Math.abs(curPos),
+      over: newNotional > cfg.posLimitNotional,
+    };
   }
 
   // ==================== USER ACTIONS ====================
@@ -613,7 +731,11 @@ class MarketMakerApp {
     if (bid >= ask) { this.$msgBar.textContent = "Bid must be < Ask."; return; }
 
     const rfq = this.activeRfq;
-    const { action, price: dealPrice, msg } = this.env.client.decideTrade(rfq.side, rfq.size, rfq.mid, bid, ask);
+    // Evaluate the client's decision against the LIVE mid, not the mid frozen
+    // when the RFQ arrived — the market keeps moving while you quote/negotiate.
+    const liveMid = this.env.assets[rfq.symbol].price;
+    rfq.mid = liveMid;
+    const { action, price: dealPrice, msg } = this.env.client.decideTwoWay(rfq.side, rfq.size, liveMid, bid, ask);
     if (msg) this.logChat("Client", msg);
 
     if (action === "negotiate") {
@@ -632,22 +754,33 @@ class MarketMakerApp {
       return;
     }
 
-    let signedSize;
+    // Market impact follows the CLIENT (the aggressor / liquidity taker):
+    // a client sell pushes the price down, a client buy pushes it up. This is
+    // what creates adverse selection — after the client sells to you, you are
+    // long into a falling market, which is the core risk of market making.
+    let aggressorSize;
     if (action === "hit_bid") {
       const realized = this.mm.updatePosition(rfq.symbol, "buy", dealPrice, rfq.size, CLIENT_COMM_BP);
       this.$msgBar.textContent = `${rfq.symbol} – Client SELLS ${rfq.size} @ ${fmt(dealPrice)} -> you BUY. Realized PnL: ${fmtInt(realized)}`;
       this.logChat("Trade", `${rfq.symbol}: Client SOLD ${rfq.size} @ ${fmt(dealPrice)} (you BUY).`);
-      signedSize = rfq.size;
+      aggressorSize = -rfq.size;
     } else {
       const realized = this.mm.updatePosition(rfq.symbol, "sell", dealPrice, rfq.size, CLIENT_COMM_BP);
       this.$msgBar.textContent = `${rfq.symbol} – Client BUYS ${rfq.size} @ ${fmt(dealPrice)} -> you SELL. Realized PnL: ${fmtInt(realized)}`;
       this.logChat("Trade", `${rfq.symbol}: Client BOUGHT ${rfq.size} @ ${fmt(dealPrice)} (you SELL).`);
-      signedSize = -rfq.size;
+      aggressorSize = rfq.size;
     }
 
     this.$rfqInfo.textContent = "RFQ completed.";
+
+    // #2 — warn (but don't block: the client chose) if the fill breaches your limit.
+    const postRisk = this._riskCheck(rfq.symbol, 0);
+    if (postRisk.over) {
+      this.$msgBar.textContent += `  ⚠ ${rfq.symbol} over risk limit (${fmtInt(postRisk.newNotional)}/${fmtInt(postRisk.limit)}) — hedge on the exchange.`;
+    }
+
     const asset = this.env.assets[rfq.symbol];
-    const newPrice = asset.applyTradeImpact(signedSize);
+    const newPrice = asset.applyTradeImpact(aggressorSize);
     this._recordPrice(rfq.symbol, newPrice);
 
     const prices = {};
@@ -677,9 +810,14 @@ class MarketMakerApp {
     const size = this._getExchangeSizeStrict();
     if (size === null) return;
     const sym = this.currentSymbol;
+    const risk = this._riskCheck(sym, size);
+    if (risk.over && risk.increasing) {
+      this.$msgBar.textContent = `RISK LIMIT: buying ${size} ${sym} would push exposure to ${fmtInt(risk.newNotional)} (limit ${fmtInt(risk.limit)}). Reduce risk first.`;
+      return;
+    }
     const asset = this.env.assets[sym];
     const mid = asset.price;
-    const [, ask] = this.computeExchangeQuotes(mid, size);
+    const [, ask] = this.computeExchangeQuotes(mid, size, sym);
     this.mm.updatePosition(sym, "buy", ask, size, EXCH_COMM_BP);
     this.$msgBar.textContent = `${sym} – EXCHANGE: BOUGHT ${size} @ ${fmt(ask)}.`;
     this.logChat("Exchange", `${sym}: BOUGHT ${size} @ ${fmt(ask)}.`);
@@ -692,9 +830,14 @@ class MarketMakerApp {
     const size = this._getExchangeSizeStrict();
     if (size === null) return;
     const sym = this.currentSymbol;
+    const risk = this._riskCheck(sym, -size);
+    if (risk.over && risk.increasing) {
+      this.$msgBar.textContent = `RISK LIMIT: selling ${size} ${sym} would push exposure to ${fmtInt(risk.newNotional)} (limit ${fmtInt(risk.limit)}). Reduce risk first.`;
+      return;
+    }
     const asset = this.env.assets[sym];
     const mid = asset.price;
-    const [bid] = this.computeExchangeQuotes(mid, size);
+    const [bid] = this.computeExchangeQuotes(mid, size, sym);
     this.mm.updatePosition(sym, "sell", bid, size, EXCH_COMM_BP);
     this.$msgBar.textContent = `${sym} – EXCHANGE: SOLD ${size} @ ${fmt(bid)}.`;
     this.logChat("Exchange", `${sym}: SOLD ${size} @ ${fmt(bid)}.`);
